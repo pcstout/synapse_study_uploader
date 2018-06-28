@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import sys, os, argparse, getpass, tempfile, shutil, psutil
+import sys, os, logging, argparse, getpass, tempfile, shutil, psutil
 import Queue, threading, time, signal
 import synapseclient, pydicom
 from synapseclient import Project, Folder, File
@@ -72,38 +72,38 @@ class SynapseStudyUploader:
 
     def start(self):
         if self._dry_run:
-            print('~~ Dry Run ~~')
+            logging.info('~~ Dry Run ~~')
 
         self.login()
 
         project = self._synapse_client.get(Project(id = self._synapse_project))
         self.set_synapse_folder(self._synapse_project, project)
 
-        print('Uploading to Project: {0} ({1})'.format(project.name, project.id))
-        print('Uploading Directory: {0}'.format(self._local_path))
-        print('Uploading To: {0}'.format(os.path.join(self._synapse_project, (self._remote_path or ''))))
-        print('Max Threads: {0}'.format(self._thread_count))
+        logging.info('Uploading to Project: {0} ({1})'.format(project.name, project.id))
+        logging.info('Uploading Directory: {0}'.format(self._local_path))
+        logging.info('Uploading To: {0}'.format(os.path.join(self._synapse_project, (self._remote_path or ''))))
+        logging.info('Max Threads: {0}'.format(self._thread_count))
         
-        print('Loading Files...')
+        logging.info('Loading Files...')
         self.load_files()
-        print('Total Synapse Folders to Create: {0}'.format(len(self._folders)))
-        print('Total Files to Upload: {0}'.format(len(self._files)))
+        logging.info('Total Synapse Folders to Create: {0}'.format(len(self._folders)))
+        logging.info('Total Files to Upload: {0}'.format(len(self._files)))
 
         self.start_threads()
-        print('Total Threads: {0}'.format(len(self._threads)))
+        logging.info('Total Threads: {0}'.format(len(self._threads)))
 
         self.create_remote_path()
         self.queue_file_uploads()
         self.wait_for_threads()
                     
         if self._dry_run:
-            print('Dry Run Completed Successfully.')
+            logging.info('Dry Run Completed Successfully.')
         else:
-            print('Upload Completed Successfully.')
+            logging.info('Upload Completed Successfully.')
 
 
     def login(self):
-        print('Logging into Synapse...')
+        logging.info('Logging into Synapse...')
         self._username = os.getenv('SYNAPSE_USER') or self._username
         self._password = os.getenv('SYNAPSE_PASSWORD') or self._password
 
@@ -215,7 +215,7 @@ class SynapseStudyUploader:
         
         log_line += '\n  -> {0}'.format(full_synapse_path)
 
-        print (log_line)
+        logging.info(log_line)
 
         synapse_folder = Folder(folder_name, parent=synapse_parent)
 
@@ -285,7 +285,7 @@ class SynapseStudyUploader:
         value = None
 
         if data_element == None:
-            print('Field not found: {0}'.format(field_name))
+            logging.warning('Field not found: {0}'.format(field_name))
         elif data_element.value != None:
             value = data_element.value
             try:
@@ -294,7 +294,7 @@ class SynapseStudyUploader:
                 elif type == self.DATE:
                     value = datetime.strptime(value, '%Y%M%d').date()
             except:
-                print('Could not parse {0}: {1}'.format(type, value))
+                logging.warning('Could not parse {0}: {1}'.format(type, value))
                 
         return value
 
@@ -333,7 +333,7 @@ class SynapseStudyUploader:
     def on_sigint(self, signum, frame):
         if self._is_canceling: return
         self._is_canceling = True
-        print('Canceling...')
+        logging.info('Canceling...')
         for t in self._threads: t.exit()
         sys.exit(1)
 
@@ -385,7 +385,7 @@ class UploadWorker (threading.Thread):
             for key, value in annotations.iteritems():
                 log_line += '\n    -> {0}: {1}'.format(key, value)
 
-        print(log_line)
+        logging.info(log_line)
 
         if not self._parent._dry_run:
             self._synapse_client.store(
@@ -407,9 +407,27 @@ def main(argv):
     parser.add_argument('-t', '--threads', help='The number of threads to create for uploading files.', type=int, default=SynapseStudyUploader.DEFAULT_THREAD_COUNT)
     parser.add_argument('-dr', '--dry-run', help='Dry run only. Do not upload any folders or files.', default=False, action='store_true')
     parser.add_argument('-v', '--verbose', help='Print out additional processing information', default=False, action='store_true')
+    parser.add_argument('-l', '--log-level', help='Set the logging level.', default='INFO')
 
     args = parser.parse_args()
-    
+
+
+    log_level = getattr(logging, args.log_level.upper())
+    log_file_name = 'log.txt'
+
+    logging.basicConfig(
+        filename=log_file_name,
+        filemode='w',
+        format='%(asctime)s %(levelname)s: %(message)s',
+        level=log_level
+    )
+
+    # Add console logging.
+    console = logging.StreamHandler()
+    console.setLevel(log_level)
+    console.setFormatter(logging.Formatter('%(message)s'))
+    logging.getLogger('').addHandler(console)
+
     SynapseStudyUploader(
         args.project_id
         ,args.local_folder_path
