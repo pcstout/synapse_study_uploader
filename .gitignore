@@ -1,3 +1,4 @@
 .vscode
 log.txt
-test_data
+manifest.tsv
+test_data*

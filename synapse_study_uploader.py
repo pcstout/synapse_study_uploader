@@ -14,11 +14,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import sys, os, logging, argparse, getpass, tempfile, shutil, psutil
+import sys, os, io, logging, argparse, getpass, tempfile, shutil, psutil
 import Queue, threading, time, signal
 import synapseclient, pydicom
 from synapseclient import Project, Folder, File
 from datetime import datetime
+from backports import csv
 
 class SynapseStudyUploader:
 
@@ -28,16 +29,17 @@ class SynapseStudyUploader:
     # Default number of threads to create.
     DEFAULT_THREAD_COUNT = psutil.cpu_count()
 
-    def __init__(self,
-                 synapse_project,
-                 local_path,
-                 remote_path=None,
-                 folder_depth=MAX_SYNAPSE_DEPTH,
-                 thread_count=DEFAULT_THREAD_COUNT,
-                 dry_run=False,
-                 verbose=False,
-                 username=None,
-                 password=None):
+    def __init__(self
+                 ,synapse_project
+                 ,local_path
+                 ,remote_path=None
+                 ,folder_depth=MAX_SYNAPSE_DEPTH
+                 ,thread_count=DEFAULT_THREAD_COUNT
+                 ,create_manifest_only=False
+                 ,dry_run=False
+                 ,verbose=False
+                 ,username=None
+                 ,password=None):
 
         self._dry_run = dry_run
         self._verbose = verbose
@@ -46,6 +48,7 @@ class SynapseStudyUploader:
         self._remote_path = None
         self._folder_depth = folder_depth
         self._thread_count = thread_count
+        self._create_manifest_only = create_manifest_only
         self._synapse_folders = {}
         self._username = username
         self._password = password
@@ -79,28 +82,23 @@ class SynapseStudyUploader:
         project = self._synapse_client.get(Project(id = self._synapse_project))
         self.set_synapse_folder(self._synapse_project, project)
 
-        logging.info('Uploading to Project: {0} ({1})'.format(project.name, project.id))
-        logging.info('Uploading Directory: {0}'.format(self._local_path))
-        logging.info('Uploading To: {0}'.format(os.path.join(self._synapse_project, (self._remote_path or ''))))
+        logging.info('Upload to Project: {0} ({1})'.format(project.name, project.id))
+        logging.info('Upload Directory: {0}'.format(self._local_path))
+        logging.info('Upload To: {0}'.format(os.path.join(self._synapse_project, (self._remote_path or ''))))
         logging.info('Max Threads: {0}'.format(self._thread_count))
-        
+                
         logging.info('Loading Files...')
         self.load_files()
-        logging.info('Total Synapse Folders to Create: {0}'.format(len(self._folders)))
-        logging.info('Total Files to Upload: {0}'.format(len(self._files)))
+        logging.info('Total Synapse Folders: {0}'.format(len(self._folders)))
+        logging.info('Total Files: {0}'.format(len(self._files)))
 
-        self.start_threads()
-        logging.info('Total Threads: {0}'.format(len(self._threads)))
-
-        self.create_remote_path()
-        self.queue_file_uploads()
-        self.wait_for_threads()
-                    
-        if self._dry_run:
-            logging.info('Dry Run Completed Successfully.')
+        if self._create_manifest_only:
+            logging.info('Generating Manifest File...')
+            self.create_manifest()
         else:
-            logging.info('Upload Completed Successfully.')
-
+            logging.info('Uploading Files...')
+            self.upload_files()
+        
 
     def login(self):
         logging.info('Logging into Synapse...')
@@ -116,6 +114,67 @@ class SynapseStudyUploader:
         self._synapse_client = synapseclient.login(self._username, self._password, silent=True)
 
 
+    def upload_files(self):
+        self.start_threads(UploadWorker, len(self._files))
+
+        self.create_remote_path()
+        self.queue_file_uploads()
+        self.wait_for_threads()
+
+        if self._dry_run:
+            logging.info('Dry Run Completed Successfully.')
+        else:
+            logging.info('Upload Completed Successfully.')
+
+
+    def create_manifest(self):
+        self.create_remote_path()
+
+        total_folders = len(self._folders)
+
+        folder_name_padding = len(str(total_folders))
+        if folder_name_padding < 2: folder_name_padding = 2
+
+        folder_num = 0
+
+        filename = 'manifest.tsv'
+
+        keys = ['path', 'parent', 'name', 'forceVersion'] + FileMetadataWorker.DICOM_ANNOTATION_FIELDS.keys()
+
+        with io.open(filename, 'w', encoding='utf8') as fp:
+            csvWriter = csv.DictWriter(fp, keys, restval='', extrasaction='ignore', delimiter=u'\t')
+            csvWriter.writeheader()
+            
+            for files in self._folders:
+                folder_num += 1
+                folder_path = (self._remote_path or '')
+                
+                if total_folders > 1:
+                    folder_name = str(folder_num).zfill(folder_name_padding)
+                    folder_path = os.path.join(folder_path, folder_name)
+                    self.create_folder_in_synapse(folder_path)
+                
+                for file_info in files:
+                    file_name = file_info["calculated_name"]
+                    file_full_local_path = file_info['full_path']
+
+                    full_synapse_path, synapse_parent, _ = self.to_synapse_path(os.path.join(folder_path, file_name))
+                    logging.info('{0} -> {1}'.format(file_full_local_path, full_synapse_path))
+
+                    row = {
+                        "path": file_full_local_path
+                        ,"parent": synapse_parent.id
+                        ,"forceVersion": True
+                        ,"name": file_name
+                    }
+                    for field_name in FileMetadataWorker.DICOM_ANNOTATION_FIELDS.keys():
+                        row[field_name] = file_info.get('annotations', {}).get(field_name)
+
+                    csvWriter.writerow(row)
+
+        logging.info('Manifest written to: {0}'.format(filename))
+
+
     def create_remote_path(self):
         if self._remote_path != None:
             path = ''
@@ -124,17 +183,18 @@ class SynapseStudyUploader:
                 self.create_folder_in_synapse(path)
 
 
-    def start_threads(self):
+    def start_threads(self, worker_type, limit):
         total_threads = self._thread_count
-        total_files = len(self._files)
 
-        if total_threads > total_files:
-            total_threads = total_files
+        if total_threads > limit:
+            total_threads = limit
 
         for _ in xrange(total_threads):
-            thread = UploadWorker(self)
+            thread = worker_type(self)
             self._threads.append(thread)
             thread.start()
+
+        logging.info('Total Threads: {0}'.format(len(self._threads)))
 
 
     def wait_for_threads(self):
@@ -146,6 +206,8 @@ class SynapseStudyUploader:
 
         # Wait for the threads to finish
         for t in self._threads: t.join()
+
+        self._threads = []
 
 
     def queue_file_uploads(self):
@@ -178,23 +240,27 @@ class SynapseStudyUploader:
 
 
     def load_files(self):
+        self.start_threads(FileMetadataWorker, self._thread_count)
+
         # Find all the files and get the calculated file name and annotations.
         for dirpath, dirnames, filenames in os.walk(self._local_path):
             for filename in filenames:
                 full_file_name = os.path.join(dirpath, filename)
                 
-                calc_filename, annotations = self.get_metadata(full_file_name)
-
-                self._files.append({
-                    "path": dirpath,
-                    "name": filename,
-                    "full_path": full_file_name,
-                    "calc_name": calc_filename,
-                    "annotations": annotations
-                })
+                file_info = {
+                    "path": dirpath
+                    ,"name": filename
+                    ,"full_path": full_file_name
+                    ,"calculated_name": filename
+                    ,"annotations": {}
+                }
+                self._files.append(file_info)
+                self._work_queue.put(file_info)
         
+        self.wait_for_threads()
+
         # Group the files by name.
-        groups = self.group_by(self._files, 'calc_name')
+        groups = self.group_by(self._files, 'calculated_name')
         
         # Unique the duplicate file names.
         for filename, files in groups.iteritems():
@@ -203,7 +269,7 @@ class SynapseStudyUploader:
             counter = 0
             for file in files:
                 counter += 1
-                file['calc_name'] = '{0}_{1}'.format(counter, file['calc_name'])
+                file['calculated_name'] = '{0}_{1}'.format(counter, file['calculated_name'])
 
         self._folders = list([self._files[i:i + self._folder_depth] for i in xrange(0, len(self._files), self._folder_depth)])
 
@@ -227,76 +293,6 @@ class SynapseStudyUploader:
 
         self.set_synapse_folder(full_synapse_path, synapse_folder)
         return synapse_folder
-
-
-    STRING = 'str'
-    INTEGER = 'int'
-    DATE = 'date'
-
-
-    DICOM_ANNOTATION_FIELDS = {
-        "ContentDate": DATE
-        ,"ContentTime": INTEGER
-        ,"DeviceSerialNumber": STRING
-        ,"InstanceNumber": INTEGER
-        ,"InstitutionName": STRING
-        ,"Manufacturer": STRING
-        ,"Modality": STRING
-        ,"PatientBirthDate": DATE
-        ,"PatientID": STRING
-        ,"PerformedProcedureStepID": STRING
-        ,"PerformedProcedureStepStartDate": DATE
-        ,"PerformedProcedureStepStartTime": STRING
-        ,"SOPClassUID": STRING
-        ,"SOPInstanceUID": STRING
-        #,"SequenceOfUltrasoundRegions": STRING
-        ,"SeriesDate": DATE
-        ,"SeriesInstanceUID": STRING
-        ,"SeriesNumber": INTEGER
-        ,"SeriesTime": INTEGER
-        ,"SoftwareVersions": STRING
-        ,"StudyDate": DATE
-        ,"StudyID": STRING
-        ,"StudyInstanceUID": STRING
-        ,"StudyTime": INTEGER
-    }
-
-
-    def get_metadata(self, local_file):
-        filename = os.path.basename(local_file)
-        annotations = {}
-
-        if local_file.lower().endswith('.dcm'):
-            ds = pydicom.dcmread(local_file)
-            filename = '{0}_{1}_{2}'.format(ds.PatientID, ds.StudyDate, filename).replace('-', '_')
-
-            for field_name, type in self.DICOM_ANNOTATION_FIELDS.iteritems():
-                value = self.dicom_field_to_annotation_field(ds, field_name, type=type)
-                if value != None:
-                    annotations[field_name] = value
-        else:
-            None
-
-        return filename, annotations
-
-
-    def dicom_field_to_annotation_field(self, dataset, field_name, type=STRING):
-        data_element = dataset.data_element(field_name)
-        value = None
-
-        if data_element == None:
-            logging.warning('Field not found: {0}'.format(field_name))
-        elif data_element.value != None:
-            value = data_element.value
-            try:
-                if type == self.INTEGER:
-                    value = int(value)
-                elif type == self.DATE:
-                    value = datetime.strptime(value, '%Y%M%d').date()
-            except:
-                logging.warning('Could not parse {0}: {1}'.format(type, value))
-                
-        return value
 
 
     def get_synapse_folder(self, synapse_path):
@@ -338,6 +334,112 @@ class SynapseStudyUploader:
         sys.exit(1)
 
 
+class FileMetadataWorker (threading.Thread):
+    exit_thread = False
+
+    def __init__(self, parent):
+        super(FileMetadataWorker, self).__init__()
+        self._parent = parent
+        self._lock = self._parent._thread_lock
+        self._queue = self._parent._work_queue
+
+
+    def run(self):
+        while not self.exit_thread:
+            self._lock.acquire()
+            if not self._queue.empty():
+                file_info = self._queue.get()
+
+                q_count = self._queue.qsize()
+                if q_count % 1000 == 0:
+                    print('{0} files remaining...'.format(q_count))
+
+                self._lock.release()
+                self.add_metadata(file_info)
+            else:
+                self._lock.release()
+            time.sleep(.100)
+
+    
+    def exit(self):
+        self.exit_thread = True
+
+
+    def add_metadata(self, file_info):
+        if file_info['name'].lower().endswith('.dcm'):
+            ds = pydicom.dcmread(file_info['full_path'])
+            file_info['calculated_name'] = '{0}_{1}_{2}'.format(
+                ds.PatientID,
+                ds.StudyDate,
+                file_info['name']).replace('-', '_')
+
+            annotations = {}
+
+            for field_name, type in self.DICOM_ANNOTATION_FIELDS.iteritems():
+                value = self.dicom_field_to_annotation_field(ds, field_name, type=type)
+                if value != None:
+                    annotations[field_name] = value
+
+            file_info['annotations'] = annotations
+        else:
+            None
+
+
+    STRING = 'str'
+    INTEGER = 'int'
+    DATE = 'date'
+
+
+    DICOM_ANNOTATION_FIELDS = {
+        "ContentDate": DATE
+        ,"ContentTime": INTEGER
+        ,"DeviceSerialNumber": STRING
+        ,"InstanceNumber": INTEGER
+        ,"InstitutionName": STRING
+        ,"Manufacturer": STRING
+        ,"Modality": STRING
+        ,"PatientBirthDate": DATE
+        ,"PatientID": STRING
+        ,"PerformedProcedureStepID": STRING
+        ,"PerformedProcedureStepStartDate": DATE
+        ,"PerformedProcedureStepStartTime": STRING
+        ,"SOPClassUID": STRING
+        ,"SOPInstanceUID": STRING
+        #,"SequenceOfUltrasoundRegions": STRING
+        ,"SeriesDate": DATE
+        ,"SeriesInstanceUID": STRING
+        ,"SeriesNumber": INTEGER
+        ,"SeriesTime": INTEGER
+        ,"SoftwareVersions": STRING
+        ,"StudyDate": DATE
+        ,"StudyID": STRING
+        ,"StudyInstanceUID": STRING
+        ,"StudyTime": INTEGER
+    }
+
+    def dicom_field_to_annotation_field(self, dataset, field_name, type=STRING):
+        value = None
+        
+        try:
+            data_element = dataset.data_element(field_name)
+            
+            if data_element == None:
+                logging.warning('Field not found: {0}'.format(field_name))
+            elif data_element.value != None:
+                value = data_element.value
+                try:
+                    if type == self.INTEGER:
+                        value = int(value)
+                    elif type == self.DATE:
+                        value = datetime.strptime(value, '%Y%M%d').date()
+                except Exception as parse_ex:
+                    logging.warning('Could not parse: {0}, {1} - {2}'.format(type, value, parse_ex.message))
+        except Exception as ex:
+            logging.warning('Could not parse: {0} - {1}'.format(field_name, ex.message))
+                
+        return value
+
+
 class UploadWorker (threading.Thread):
     exit_thread = False
 
@@ -367,7 +469,7 @@ class UploadWorker (threading.Thread):
 
 
     def upload_file_to_synapse(self, file_info, synapse_folder_path):
-        filename = file_info['calc_name']
+        filename = file_info['calculated_name']
         full_file_name = file_info['full_path']
         annotations = file_info['annotations']
 
@@ -405,6 +507,7 @@ def main(argv):
     parser.add_argument('-p', '--password', help='Synapse password.', default=None)
     parser.add_argument('-d', '--depth', help='The maximum number of child folders or files under a Synapse Project/Folder.', type=int, default=SynapseStudyUploader.MAX_SYNAPSE_DEPTH)
     parser.add_argument('-t', '--threads', help='The number of threads to create for uploading files.', type=int, default=SynapseStudyUploader.DEFAULT_THREAD_COUNT)
+    parser.add_argument('-cmo', '--create-manifest-only', help='Create a manifest file.', default=False, action='store_true')
     parser.add_argument('-dr', '--dry-run', help='Dry run only. Do not upload any folders or files.', default=False, action='store_true')
     parser.add_argument('-v', '--verbose', help='Print out additional processing information', default=False, action='store_true')
     parser.add_argument('-l', '--log-level', help='Set the logging level.', default='INFO')
@@ -434,6 +537,7 @@ def main(argv):
         ,remote_path=args.remote_folder_path
         ,folder_depth=args.depth
         ,thread_count=args.threads
+        ,create_manifest_only=args.create_manifest_only
         ,dry_run=args.dry_run
         ,verbose=args.verbose
         ,username=args.username
