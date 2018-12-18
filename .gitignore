@@ -2,3 +2,4 @@
 log.txt
 manifest.tsv
 test_data*
+.venv
