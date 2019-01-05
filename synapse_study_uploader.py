@@ -432,10 +432,10 @@ class FileMetadataWorker (threading.Thread):
                         value = datetime.strptime(value, '%Y%M%d').date()
                 except Exception as parse_ex:
                     logging.warning(
-                        'Could not parse: {0}, {1} - {2}'.format(type, value, parse_ex.message))
+                        'Could not parse: {0}, {1} - {2}'.format(type, value, str(parse_ex)))
         except Exception as ex:
             logging.warning(
-                'Could not parse: {0} - {1}'.format(field_name, ex.message))
+                'Could not parse: {0} - {1}'.format(field_name, str(ex)))
 
         return value
 
