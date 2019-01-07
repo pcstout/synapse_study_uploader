@@ -126,9 +126,9 @@ class SynapseStudyUploader:
         self.wait_for_threads()
 
         if self._dry_run:
-            logging.info('Dry Run Completed Successfully.')
+            logging.info('Dry Run Completed.')
         else:
-            logging.info('Upload Completed Successfully.')
+            logging.info('Upload Completed.')
 
     def create_manifest(self):
         self.create_remote_path()
@@ -203,7 +203,7 @@ class SynapseStudyUploader:
     def wait_for_threads(self):
         # Wait for the queue to empty.
         while not self._work_queue.empty():
-            time.sleep(.100)
+            time.sleep(.10)
 
         # Tell the threads to exit.
         for t in self._threads:
@@ -252,6 +252,10 @@ class SynapseStudyUploader:
             for filename in filenames:
                 full_file_name = os.path.join(dirpath, filename)
 
+                # Skip empty files since these will error when uploading via the synapseclient.
+                if (os.path.getsize(full_file_name) < 1):
+                    continue
+
                 file_info = {
                     "path": dirpath, "name": filename, "full_path": full_file_name, "calculated_name": filename, "annotations": {}
                 }
@@ -290,7 +294,7 @@ class SynapseStudyUploader:
         synapse_folder = Folder(folder_name, parent=synapse_parent)
 
         if self._dry_run:
-            # Give the folder a fake id so it doesn't blow when this folder is used as a parent.
+            # Give the folder a fake id so it doesn't blow up when this folder is used as a parent.
             synapse_folder.id = 'syn0'
         else:
             synapse_folder = self._synapse_client.store(
@@ -360,28 +364,32 @@ class FileMetadataWorker (threading.Thread):
                 self.add_metadata(file_info)
             else:
                 self._lock.release()
-            time.sleep(.100)
+            time.sleep(.10)
 
     def exit(self):
         self.exit_thread = True
 
     def add_metadata(self, file_info):
         if file_info['name'].lower().endswith('.dcm'):
-            ds = pydicom.dcmread(file_info['full_path'])
-            file_info['calculated_name'] = '{0}_{1}_{2}'.format(
-                ds.PatientID,
-                ds.StudyDate,
-                file_info['name']).replace('-', '_')
+            try:
+                ds = pydicom.dcmread(file_info['full_path'])
+                file_info['calculated_name'] = '{0}_{1}_{2}'.format(
+                    ds.PatientID,
+                    ds.StudyDate,
+                    file_info['name']).replace('-', '_')
 
-            annotations = {}
+                annotations = {}
 
-            for field_name, type in self.DICOM_ANNOTATION_FIELDS.items():
-                value = self.dicom_field_to_annotation_field(
-                    ds, field_name, type=type)
-                if value != None:
-                    annotations[field_name] = value
+                for field_name, type in self.DICOM_ANNOTATION_FIELDS.items():
+                    value = self.dicom_field_to_annotation_field(
+                        ds, field_name, type=type)
+                    if value != None:
+                        annotations[field_name] = value
 
-            file_info['annotations'] = annotations
+                file_info['annotations'] = annotations
+            except Exception as ex:
+                logging.error(
+                    'Could not read DICOM file: {0} - {1}'.format(file_info['full_path'], str(ex)))
         else:
             None
 
@@ -462,7 +470,7 @@ class UploadWorker (threading.Thread):
                     folder_obj["file_info"], folder_obj["folder_path"])
             else:
                 self._lock.release()
-            time.sleep(.100)
+            time.sleep(.10)
 
     def exit(self):
         self.exit_thread = True
@@ -490,9 +498,25 @@ class UploadWorker (threading.Thread):
         logging.info(log_line)
 
         if not self._parent._dry_run:
-            self._synapse_client.store(
-                File(temp_file, parent=synapse_parent, annotations=annotations), forceVersion=False
-            )
+            syn_file = None
+            max_attempts = 5
+            attempt_number = 1
+
+            while attempt_number <= max_attempts and not syn_file and not self.exit_thread:
+                try:
+                    attempt_number += 1
+                    syn_file = self._synapse_client.store(File(
+                        temp_file, parent=synapse_parent, annotations=annotations), forceVersion=False)
+                except Exception as ex:
+                    logging.error(
+                        'Error uploading file: {0} - {1}'.format(full_file_name, str(ex)))
+                    if attempt_number <= max_attempts:
+                        logging.info('Retrying: {0}'.format(full_file_name))
+                        time.sleep(3)
+
+            if not syn_file:
+                logging.error(
+                    'Failed to upload file: {0}'.format(full_file_name))
 
         # Delete the temp file.
         os.remove(temp_file)
